@@ -5,11 +5,11 @@
 #include <cstdio>
 
 #include <OpenImageIO/filesystem.h>
-#include <OpenImageIO/fmath.h>
 #include <OpenImageIO/imagebufalgo.h>
 #include <OpenImageIO/imageio.h>
 
 #include <webp/decode.h>
+#include <webp/demux.h>
 
 OIIO_PLUGIN_NAMESPACE_BEGIN
 
@@ -22,12 +22,24 @@ public:
     virtual ~WebpInput() { close(); }
     virtual const char* format_name() const override { return "webp"; }
     virtual bool open(const std::string& name, ImageSpec& spec) override;
+    virtual bool seek_subimage(int subimage, int miplevel) override;
     virtual bool read_native_scanline(int subimage, int miplevel, int y, int z,
                                       void* data) override;
+    virtual int current_subimage(void) const override
+    {
+        lock_guard lock(m_mutex);
+        return m_subimage;
+    }
     virtual bool close() override;
 
 private:
     std::string m_filename;
+
+    WebPDemuxer* m_demux; // Demuxer object
+    WebPIterator m_iter;  // Frame iterator
+
+    int m_subimage;  // What subimage are we looking at?
+
     uint8_t* m_decoded_image;
     uint64_t m_image_size;
     long int m_scanline_size;
@@ -35,10 +47,12 @@ private:
 
     void init()
     {
+        m_demux         = NULL;
         m_image_size    = 0;
         m_scanline_size = 0;
         m_decoded_image = NULL;
         m_file          = NULL;
+        m_subimage      = -1;
     }
 };
 
@@ -104,20 +118,36 @@ WebpInput::open(const std::string& name, ImageSpec& spec)
         return false;
     }
 
+    WebPData data;
+    data.bytes = &encoded_image[0];
+    data.size  = m_image_size;
+
+    m_demux = WebPDemux(&data);
+    if (m_demux == nullptr) {
+        errorf("Failed to parse %s file", m_filename);
+        //close();
+        return false;
+    }
+    uint32_t canvas_width  = WebPDemuxGetI(m_demux, WEBP_FF_CANVAS_WIDTH);
+    uint32_t canvas_height = WebPDemuxGetI(m_demux, WEBP_FF_CANVAS_HEIGHT);
+
     const int nchannels = 4;
     m_scanline_size     = width * nchannels;
-    m_spec              = ImageSpec(width, height, nchannels, TypeDesc::UINT8);
+    m_spec = ImageSpec(canvas_width, canvas_height, nchannels, TypeDesc::UINT8);
     m_spec.attribute("oiio:ColorSpace", "sRGB");  // webp is always sRGB
     spec = m_spec;
 
-    if (!(m_decoded_image = WebPDecodeRGBA(&encoded_image[0],
-                                           encoded_image.size(), &m_spec.width,
-                                           &m_spec.height))) {
-        errorf("Couldn't decode %s", m_filename);
-        close();
+    if (!seek_subimage(0, 0)) {
         return false;
     }
 
+    if (m_iter.num_frames > 1) {
+        m_spec.attribute("oiio:Movie", 1); // mark as animated
+
+        int delay  = m_iter.duration;
+        int rat[2] = { 1000, delay };
+        m_spec.attribute("FramesPerSecond", TypeRational, &rat);
+    }
 
     // WebP requires unassociated alpha, and it's sRGB.
     // Handle this all by wrapping an IB around it.
@@ -131,17 +161,50 @@ WebpInput::open(const std::string& name, ImageSpec& spec)
     return true;
 }
 
+bool
+WebpInput::seek_subimage(int subimage, int miplevel)
+{
+    if (subimage < 0 || miplevel != 0)
+        return false;
+
+    if (m_subimage == subimage) {
+        // We're already pointing to the right subimage
+        return true;
+    }
+
+    int frame_num = subimage + 1; // oiio subimages are 0 based, webp frames start with 1
+    if (WebPDemuxGetFrame(m_demux, frame_num, &m_iter)) {
+        //m_spec.width       = m_gif_file->SWidth;
+        //m_spec.height      = m_gif_file->SHeight;
+        //m_spec.depth       = 1;
+        //m_spec.full_height = m_spec.height;
+        //m_spec.full_width  = m_spec.width;
+        //m_spec.full_depth  = m_spec.depth;
+        int width;
+        int height;
+        m_subimage = subimage;
+
+        if (!(m_decoded_image = WebPDecodeRGBA(m_iter.fragment.bytes,
+                                               m_iter.fragment.size, &width,
+                                               &height))) {
+            errorf("Couldn't decode %s on frame %i", m_filename, frame_num);
+            close();
+            return false;
+        }
+        return true;
+    }
+
+    return false;
+}
+
 
 bool
-WebpInput::read_native_scanline(int subimage, int miplevel, int y, int z,
-                                void* data)
+WebpInput::read_native_scanline(int subimage, int miplevel, int y,
+                                int /*z*/, void* data)
 {
-    // Not necessary to lock and seek -- no subimages in Webp, and since
-    // the only thing we're doing here is a memcpy, it's already threadsafe.
-    //
-    // lock_guard lock (m_mutex);
-    // if (! seek_subimage (subimage, miplevel))
-    //     return false;
+    lock_guard lock (m_mutex);
+    if (! seek_subimage (subimage, miplevel))
+         return false;
 
     if (y < 0 || y >= m_spec.height)  // out of range scanline
         return false;
@@ -160,6 +223,10 @@ WebpInput::close()
     if (m_decoded_image) {
         free(m_decoded_image);
         m_decoded_image = NULL;
+    }
+    WebPDemuxReleaseIterator(&m_iter);
+    if (m_demux) {
+        WebPDemuxDelete(m_demux);
     }
     return true;
 }
