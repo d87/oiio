@@ -24,6 +24,12 @@ find_library (WEBP_LIBRARY webp
                   ENV WEBP_LIBRARY_PATH
               DOC "The directory where Webp libraries reside")
 
+find_library (WEBP_DEMUX_LIBRARY webpdemux
+              HINTS
+                  ${WEBP_LIBRARY_PATH}
+                  ENV WEBP_LIBRARY_PATH
+              DOC "The directory where Webp Demux libraries reside")
+
 include (FindPackageHandleStandardArgs)
 find_package_handle_standard_args (Webp
     REQUIRED_VARS   WEBP_INCLUDE_DIR
@@ -40,6 +46,14 @@ if (Webp_FOUND)
             INTERFACE_INCLUDE_DIRECTORIES "${WEBP_INCLUDES}")
         set_property(TARGET Webp::Webp APPEND PROPERTY
             IMPORTED_LOCATION "${WEBP_LIBRARIES}")
+    endif ()
+
+    if (NOT TARGET Webp::WebpDemux)
+        add_library(Webp::WebpDemux UNKNOWN IMPORTED)
+        set_target_properties(Webp::WebpDemux PROPERTIES
+            INTERFACE_INCLUDE_DIRECTORIES "${WEBP_INCLUDES}")
+        set_property(TARGET Webp::WebpDemux APPEND PROPERTY
+            IMPORTED_LOCATION "${WEBP_DEMUX_LIBRARY}")
     endif ()
 endif ()
 
